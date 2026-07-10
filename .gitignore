@@ -1,0 +1,34 @@
+# Dependencies
+frontend/node_modules/
+node_modules/
+
+# Build output
+frontend/dist/
+dist/
+
+# Vite cache
+frontend/.vite/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+frontend/.env
+frontend/.env.local
+
+# Generated files (rebuilt at deploy time)
+frontend/public/notebooks/loan_targeting_analysis.html
+
+# Temporary / dev helpers
+parse_layout.py
+pbix_layout.json
+run-dev.ps1
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.suo
+*.ntvs*
