@@ -16,8 +16,8 @@ frontend/.vite/
 frontend/.env
 frontend/.env.local
 
-# Generated files (rebuilt at deploy time)
-frontend/public/notebooks/loan_targeting_analysis.html
+# Generated files — committed so Vercel build doesn't need Python/Jupyter
+# frontend/public/notebooks/loan_targeting_analysis.html
 
 # Temporary / dev helpers
 parse_layout.py
@@ -32,3 +32,4 @@ Thumbs.db
 .vscode/
 *.suo
 *.ntvs*
+.vercel
