@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import {
   ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, BarChart, Bar, Cell, Legend,
+  ResponsiveContainer, BarChart, Bar, Legend,
   RadarChart, PolarGrid, PolarAngleAxis, Radar,
 } from 'recharts'
 import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet'
@@ -15,11 +15,6 @@ const CAUSE_COLORS: Record<string, string> = {
   Landslide:  '#10b981',
   Other:      '#8b5cf6',
 }
-
-const REGION_COLORS = [
-  '#3b82f6','#f97316','#10b981','#8b5cf6','#ef4444',
-  '#eab308','#06b6d4','#ec4899','#14b8a6',
-]
 
 const VALIDITY_LABELS: Record<number, string> = {
   4: 'Definite',
@@ -163,7 +158,7 @@ function RegionBarChart({ data }: { data: TsunamiEvent[]; regionColors?: Record<
       counts[ev.region][label] = (counts[ev.region][label] ?? 0) + 1
     })
     return Object.entries(counts)
-      .map(([region, vals]) => ({ region: region.replace(' OCEAN', '').replace(' SEA', ' Sea'), ...vals }))
+      .map(([region, vals]) => ({ region: region.replace(' OCEAN', '').replace(' SEA', ' Sea'), ...vals } as { region: string; Definite: number; Probable: number; Questionable: number; Doubtful: number }))
       .sort((a, b) => (b.Definite + b.Probable) - (a.Definite + a.Probable))
   }, [data])
 
@@ -288,11 +283,6 @@ export default function TsunamiDashboard() {
       (b.damageSeverity ?? 0) > (a.damageSeverity ?? 0) ? b : a
     ).country,
   }), [])
-
-  const regionColors: Record<string, string> = useMemo(() => {
-    const regions = [...new Set(tsunamiData.map(d => d.region))]
-    return Object.fromEntries(regions.map((r, i) => [r, REGION_COLORS[i % REGION_COLORS.length]]))
-  }, [])
 
   return (
     <div className="flex flex-col gap-4">
