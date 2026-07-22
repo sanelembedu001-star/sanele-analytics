@@ -18,7 +18,7 @@ export default function Header() {
         </svg>
         <div>
           <h1 className="text-xl font-bold tracking-wide">Analytics Platform</h1>
-          <p className="text-blue-200 text-xs">Loan Targeting &amp; Tsunami Dashboard</p>
+          <p className="text-blue-200 text-xs">Loan Targeting · Tsunami Dashboard · AI Ops</p>
         </div>
       </div>
     </header>
