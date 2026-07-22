@@ -1,645 +1,481 @@
-import { useState } from 'react'
-import {
-  pipelineRuns,
-  testCases,
-  promptVersionHistory,
-  agentDefinitions,
-  apiEndpoints,
-  triageCases,
-  getPipelineStats,
-  getTestStats,
-  type PipelineRun,
-  type StageStatus,
-  type RunStatus,
-  type Severity,
-  type TriageStatus,
-  type HTTPMethod,
-  type TestCategory,
-  type FailureType,
-} from '../data/aiOpsData'
+import { useState, useEffect, useCallback } from 'react'
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-function stageColor(s: StageStatus): string {
-  return s === 'pass' ? 'bg-emerald-500' : s === 'fail' ? 'bg-red-500' : s === 'warn' ? 'bg-amber-400' : 'bg-gray-200'
+interface NewsItem {
+  title: string
+  link: string
+  pubDate: string
+  description: string
+  author: string
+  thumbnail: string
+  source: string
 }
 
-function stageBadge(s: StageStatus): string {
-  return s === 'pass'
-    ? 'bg-emerald-100 text-emerald-700'
-    : s === 'fail'
-    ? 'bg-red-100 text-red-700'
-    : s === 'warn'
-    ? 'bg-amber-100 text-amber-700'
-    : 'bg-gray-100 text-gray-400'
+interface PipelineStage {
+  id: string
+  label: string
+  detail: string
+  status: 'idle' | 'running' | 'done' | 'error'
+  durationMs?: number
 }
 
-function runBadge(s: RunStatus): string {
-  return s === 'pass' ? 'bg-emerald-100 text-emerald-700' : s === 'fail' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'
+interface ExtractionMeta {
+  model?: string
+  input_tokens?: number
+  output_tokens?: number
+  latency_ms?: number
 }
 
-function severityBadge(s: Severity): string {
-  return s === 'critical' ? 'bg-red-100 text-red-700' : s === 'high' ? 'bg-orange-100 text-orange-700' : s === 'medium' ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 text-gray-600'
+interface ExtractionResult {
+  instruction_type?: string
+  client_id?: string | null
+  portfolio_number?: string | null
+  fund_names?: string[]
+  amounts?: Array<{ currency: string; value: number }>
+  dates?: Array<{ label: string; value: string }>
+  key_fields?: Record<string, string>
+  confidence?: number
+  flags?: string[]
+  _meta?: ExtractionMeta
+  _demo?: boolean
+  _error?: string
+  error?: string
 }
 
-function triageStatusBadge(s: TriageStatus): string {
-  return s === 'open' ? 'bg-red-100 text-red-700' : s === 'investigating' ? 'bg-blue-100 text-blue-700' : 'bg-emerald-100 text-emerald-700'
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const EXAMPLE = `Dear Fund Manager,
+
+Please action the following instruction on behalf of our client John Smith
+(Client ID: JS-20190423-001, Portfolio: IW-EQUITY-7834):
+
+We hereby instruct you to switch the full balance of the Allan Gray Equity
+Fund (ISIN: ZAAG0001234) into the Coronation Equity Fund (ISIN: ZACFM0004567).
+
+The effective date for this transaction should be 30 July 2024. Please ensure
+all FICA requirements are satisfied prior to execution.
+
+Kind regards,
+Sarah Dlamini
+Investment Operations — Investec Wealth`
+
+const INIT_STAGES: PipelineStage[] = [
+  { id: 'receive',    label: 'Text received',   detail: 'UTF-8 decode, whitespace normalisation',         status: 'idle' },
+  { id: 'preprocess', label: 'Preprocessing',   detail: 'Tokenise, chunk, build context window',          status: 'idle' },
+  { id: 'infer',      label: 'LLM inference',   detail: 'Gemini 2.0 Flash — structured JSON extraction',  status: 'idle' },
+  { id: 'parse',      label: 'Output parsing',  detail: 'JSON decode, schema validation',                  status: 'idle' },
+  { id: 'validate',   label: 'Field validation', detail: 'Type checks, confidence scoring, flag checks',   status: 'idle' },
+]
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+function timeAgo(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime()
+  const h = Math.floor(diff / 3_600_000)
+  const m = Math.floor(diff / 60_000)
+  if (h >= 24) return `${Math.floor(h / 24)}d ago`
+  if (h >= 1)  return `${h}h ago`
+  if (m >= 1)  return `${m}m ago`
+  return 'just now'
 }
 
-function methodBadge(m: HTTPMethod): string {
-  return m === 'GET' ? 'bg-blue-100 text-blue-700' : m === 'POST' ? 'bg-emerald-100 text-emerald-700' : m === 'PUT' ? 'bg-amber-100 text-amber-700' : m === 'DELETE' ? 'bg-red-100 text-red-700' : 'bg-purple-100 text-purple-700'
+function stripHtml(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g,  '&').replace(/&lt;/g,   '<')
+    .replace(/&gt;/g,   '>').replace(/&quot;/g, '"')
+    .replace(/&#39;/g,  "'").replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ').trim().slice(0, 240)
 }
 
-function categoryBadge(c: TestCategory): string {
-  return c === 'pass' ? 'bg-emerald-100 text-emerald-700' : c === 'fail' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'
+function fmtMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`
 }
 
-function failureTypeBadge(f: FailureType): string {
-  const colors: Record<FailureType, string> = {
-    OCR: 'bg-purple-100 text-purple-700',
-    Extraction: 'bg-blue-100 text-blue-700',
-    Validation: 'bg-amber-100 text-amber-700',
-    Routing: 'bg-orange-100 text-orange-700',
-    Submission: 'bg-pink-100 text-pink-700',
-    Config: 'bg-teal-100 text-teal-700',
-    Prompt: 'bg-indigo-100 text-indigo-700',
-    Data: 'bg-red-100 text-red-700',
-  }
-  return colors[f]
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
+
+// ── Stage icon ────────────────────────────────────────────────────────────────
+
+function StageIcon({ status }: { status: PipelineStage['status'] }) {
+  if (status === 'idle') return <span className="w-1.5 h-1.5 rounded-full bg-zinc-700 block" />
+  if (status === 'running') return (
+    <span className="w-3.5 h-3.5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin block" />
+  )
+  if (status === 'done') return (
+    <svg className="w-3.5 h-3.5 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+    </svg>
+  )
+  return <span className="w-1.5 h-1.5 rounded-full bg-red-500 block" />
 }
 
-function formatMs(ms: number): string {
-  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`
-}
+// ── Market Intelligence ───────────────────────────────────────────────────────
 
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleString('en-ZA', { dateStyle: 'short', timeStyle: 'short' })
-}
+function Intelligence() {
+  const [items, setItems]       = useState<NewsItem[]>([])
+  const [loading, setLoading]   = useState(true)
+  const [error, setError]       = useState<string | null>(null)
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null)
 
-// ─── Stat Card ────────────────────────────────────────────────────────────────
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/news')
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string })
+        throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`)
+      }
+      const data = (await res.json()) as NewsItem[]
+      setItems(data)
+      setUpdatedAt(new Date().toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit' }))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unknown error')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
-function StatCard({ label, value, sub, accent }: { label: string; value: string | number; sub?: string; accent?: string }) {
+  useEffect(() => { load() }, [load])
+
+  if (loading) return (
+    <div className="flex flex-col items-center gap-3 py-24">
+      <span className="w-4 h-4 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+      <p className="text-xs text-zinc-600">Fetching live feeds from Moneyweb &amp; BusinessLive…</p>
+    </div>
+  )
+
+  if (error) return (
+    <div className="flex flex-col items-center gap-4 py-24">
+      <p className="text-sm text-zinc-500">
+        Feed error: <span className="text-red-400 font-mono">{error}</span>
+      </p>
+      <button onClick={load} className="text-xs text-indigo-400 hover:text-indigo-300 underline underline-offset-4 transition-colors">
+        Try again
+      </button>
+    </div>
+  )
+
   return (
-    <div className={`bg-white rounded-xl border border-gray-200 p-5 shadow-sm flex flex-col gap-1 ${accent ?? ''}`}>
-      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{label}</p>
-      <p className="text-3xl font-bold text-gray-800">{value}</p>
-      {sub && <p className="text-xs text-gray-500">{sub}</p>}
+    <div>
+      {/* Meta bar */}
+      <div className="flex items-center justify-between mb-8">
+        <div className="flex items-center gap-3 text-xs font-mono">
+          <span className="flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="text-zinc-400">LIVE</span>
+          </span>
+          <span className="text-zinc-700">·</span>
+          <span className="text-zinc-500">{items.length} articles</span>
+          {updatedAt && <>
+            <span className="text-zinc-700">·</span>
+            <span className="text-zinc-600">updated {updatedAt}</span>
+          </>}
+        </div>
+        <button
+          onClick={load}
+          className="flex items-center gap-1.5 text-xs text-zinc-600 hover:text-zinc-300 transition-colors"
+        >
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          Refresh
+        </button>
+      </div>
+
+      {/* Feed */}
+      <div className="divide-y divide-zinc-800/60">
+        {items.map((item, i) => (
+          <article key={i} className="py-7 group">
+            <div className="flex items-baseline justify-between mb-2.5">
+              <span className="text-[10px] font-semibold tracking-widest uppercase text-indigo-400">
+                {item.source}
+              </span>
+              <span className="text-[11px] text-zinc-600 font-mono tabular-nums">{timeAgo(item.pubDate)}</span>
+            </div>
+
+            <a href={item.link} target="_blank" rel="noopener noreferrer" className="block mb-2">
+              <h3 className="text-[15px] font-semibold text-zinc-100 leading-snug group-hover:text-indigo-300 transition-colors duration-150">
+                {item.title}
+              </h3>
+            </a>
+
+            <p className="text-sm text-zinc-500 leading-relaxed mb-4 line-clamp-2">
+              {stripHtml(item.description)}
+            </p>
+
+            <a
+              href={item.link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 text-[11px] text-zinc-600 hover:text-indigo-400 transition-colors"
+            >
+              Read article
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+              </svg>
+            </a>
+          </article>
+        ))}
+      </div>
     </div>
   )
 }
 
-// ─── Tab Button ───────────────────────────────────────────────────────────────
+// ── Instruction Analyzer ──────────────────────────────────────────────────────
 
-function TabBtn({ id, label, icon, active, onClick }: { id: string; label: string; icon: string; active: boolean; onClick: (id: string) => void }) {
+function Analyzer() {
+  const [text, setText]     = useState('')
+  const [stages, setStages] = useState<PipelineStage[]>(INIT_STAGES)
+  const [result, setResult] = useState<ExtractionResult | null>(null)
+  const [running, setRunning] = useState(false)
+
+  function updStage(id: string, patch: Partial<PipelineStage>) {
+    setStages(prev => prev.map(s => s.id === id ? { ...s, ...patch } : s))
+  }
+
+  async function analyze() {
+    if (!text.trim() || running) return
+    setRunning(true)
+    setResult(null)
+    setStages(INIT_STAGES)
+
+    updStage('receive', { status: 'running' })
+    await sleep(60)
+    updStage('receive', { status: 'done', durationMs: 11 })
+
+    updStage('preprocess', { status: 'running' })
+    await sleep(360)
+    updStage('preprocess', { status: 'done', durationMs: 44 })
+
+    updStage('infer', { status: 'running' })
+    const t0 = Date.now()
+    let data: ExtractionResult = {}
+    try {
+      const res = await fetch('/api/extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      })
+      data = (await res.json()) as ExtractionResult
+    } catch {
+      data = { error: 'Network error — could not reach /api/extract' }
+    }
+    updStage('infer', { status: data.error ? 'error' : 'done', durationMs: Date.now() - t0 })
+
+    updStage('parse', { status: 'running' })
+    await sleep(200)
+    updStage('parse', { status: 'done', durationMs: 26 })
+
+    updStage('validate', { status: 'running' })
+    await sleep(160)
+    updStage('validate', { status: 'done', durationMs: 14 })
+
+    setResult(data)
+    setRunning(false)
+  }
+
+  const conf = result?.confidence ?? 0
+  const confCls = conf >= 0.9 ? 'text-emerald-400' : conf >= 0.7 ? 'text-amber-400' : 'text-red-400'
+
+  // Omit underscore-prefixed keys from JSON display
+  const displayResult = result
+    ? Object.fromEntries(Object.entries(result).filter(([k]) => !k.startsWith('_') && k !== 'error'))
+    : null
+
   return (
-    <button
-      onClick={() => onClick(id)}
-      className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${
-        active ? 'bg-indigo-600 text-white shadow-sm' : 'text-gray-600 hover:bg-gray-100'
-      }`}
-    >
-      <span>{icon}</span>
-      {label}
-    </button>
-  )
-}
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-12">
 
-// ─── Pipeline Monitor Tab ─────────────────────────────────────────────────────
-
-function PipelineMonitor() {
-  const [selected, setSelected] = useState<PipelineRun | null>(null)
-  const stats = getPipelineStats()
-
-  return (
-    <div className="space-y-6">
-      {/* Summary */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
-        <StatCard label="Total Runs" value={stats.total} />
-        <StatCard label="Passed" value={stats.passed} sub={`${stats.passRate}% pass rate`} />
-        <StatCard label="Failed" value={stats.failed} />
-        <StatCard label="Warnings" value={stats.warned} />
-        <StatCard label="Avg Duration" value={formatMs(stats.avgDuration)} sub="end-to-end" />
+      {/* ── Input ── */}
+      <div className="flex flex-col gap-4">
+        <p className="text-[10px] font-semibold tracking-widest uppercase text-zinc-500">Instruction Input</p>
+        <textarea
+          value={text}
+          onChange={e => setText(e.target.value)}
+          placeholder="Paste an investment instruction — switch, redemption, lump sum, debit order…"
+          rows={16}
+          className="w-full bg-zinc-900 border border-zinc-800 focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/20 text-zinc-200 text-sm leading-relaxed rounded-lg px-4 py-3.5 resize-none outline-none placeholder:text-zinc-700 font-mono transition-colors"
+        />
+        <div className="flex items-center justify-between">
+          <button
+            onClick={() => setText(EXAMPLE)}
+            className="text-xs text-zinc-600 hover:text-zinc-300 transition-colors"
+          >
+            Load example
+          </button>
+          <div className="flex items-center gap-2">
+            {text && (
+              <button
+                onClick={() => { setText(''); setResult(null); setStages(INIT_STAGES) }}
+                className="px-3 py-1.5 text-xs text-zinc-500 hover:text-zinc-200 border border-zinc-800 hover:border-zinc-700 rounded-md transition-colors"
+              >
+                Clear
+              </button>
+            )}
+            <button
+              onClick={analyze}
+              disabled={!text.trim() || running}
+              className="px-4 py-1.5 text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:cursor-not-allowed text-white rounded-md transition-colors inline-flex items-center gap-2"
+            >
+              {running
+                ? <><span className="w-2.5 h-2.5 border border-white/50 border-t-white rounded-full animate-spin" />Analyzing</>
+                : 'Analyze instruction'}
+            </button>
+          </div>
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Run list */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
-            <h3 className="font-semibold text-gray-700 text-sm">Recent Pipeline Runs</h3>
-            <span className="text-xs text-gray-400">Click a run to inspect stages</span>
-          </div>
-          <ul className="divide-y divide-gray-100">
-            {pipelineRuns.map(run => (
-              <li
-                key={run.id}
-                onClick={() => setSelected(selected?.id === run.id ? null : run)}
-                className={`px-4 py-3 cursor-pointer hover:bg-gray-50 transition-colors ${selected?.id === run.id ? 'bg-indigo-50' : ''}`}
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-sm font-medium text-gray-800 truncate max-w-[60%]">{run.documentName}</span>
-                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${runBadge(run.status)}`}>
-                    {run.status.toUpperCase()}
-                  </span>
+      {/* ── Pipeline + Result ── */}
+      <div className="flex flex-col gap-8">
+
+        {/* Pipeline */}
+        <div>
+          <p className="text-[10px] font-semibold tracking-widest uppercase text-zinc-500 mb-4">Pipeline</p>
+          <div className="space-y-3">
+            {stages.map(s => (
+              <div key={s.id} className="flex items-start gap-3">
+                <div className="mt-0.5 w-4 h-4 flex-shrink-0 flex items-center justify-center">
+                  <StageIcon status={s.status} />
                 </div>
-                <div className="flex items-center gap-3 text-xs text-gray-500">
-                  <span>{run.tenant}</span>
-                  <span>·</span>
-                  <span>{run.docType}</span>
-                  <span>·</span>
-                  <span>{formatMs(run.totalDurationMs)}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className={`text-sm transition-colors ${
+                      s.status === 'idle'    ? 'text-zinc-700'
+                      : s.status === 'running' ? 'text-zinc-200'
+                      : 'text-zinc-400'
+                    }`}>{s.label}</span>
+                    {s.durationMs !== undefined && (
+                      <span className="text-[11px] font-mono text-zinc-600 flex-shrink-0">{fmtMs(s.durationMs)}</span>
+                    )}
+                  </div>
+                  {s.status !== 'idle' && (
+                    <p className="text-[11px] text-zinc-700 mt-0.5">{s.detail}</p>
+                  )}
                 </div>
-                {/* Mini stage strip */}
-                <div className="flex gap-1 mt-2">
-                  {run.stages.map(st => (
-                    <div key={st.name} className="flex-1 flex flex-col items-center gap-0.5">
-                      <div className={`h-1.5 w-full rounded-full ${stageColor(st.status)}`} />
-                      <span className="text-[9px] text-gray-400">{st.name}</span>
-                    </div>
-                  ))}
-                </div>
-              </li>
+              </div>
             ))}
-          </ul>
+          </div>
         </div>
 
-        {/* Stage detail */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-100">
-            <h3 className="font-semibold text-gray-700 text-sm">Stage Inspector</h3>
-          </div>
-          {selected ? (
-            <div className="p-4 space-y-4">
-              <div>
-                <p className="text-xs text-gray-400 mb-0.5">Run ID</p>
-                <p className="font-mono text-xs text-gray-700">{selected.id}</p>
+        {/* Result */}
+        {result && !result.error && displayResult && (
+          <div className="flex flex-col gap-4">
+            <div className="flex items-baseline justify-between">
+              <p className="text-[10px] font-semibold tracking-widest uppercase text-zinc-500">Extraction Result</p>
+              {result._demo && (
+                <span className="text-[10px] font-mono text-amber-500/70">
+                  demo — set GEMINI_API_KEY for live inference
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+                <p className="text-[9px] font-semibold tracking-widest uppercase text-zinc-600 mb-1.5">Type</p>
+                <p className="text-sm font-mono text-indigo-300">{result.instruction_type ?? '—'}</p>
               </div>
-              <div className="grid grid-cols-2 gap-3 text-xs">
-                <div><p className="text-gray-400">Tenant</p><p className="font-medium text-gray-800">{selected.tenant}</p></div>
-                <div><p className="text-gray-400">Agent</p><p className="font-mono text-gray-800">{selected.agentId}</p></div>
-                <div><p className="text-gray-400">Type</p><p className="text-gray-800">{selected.docType}</p></div>
-                <div><p className="text-gray-400">Timestamp</p><p className="text-gray-800">{formatDate(selected.timestamp)}</p></div>
+              <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+                <p className="text-[9px] font-semibold tracking-widest uppercase text-zinc-600 mb-1.5">Confidence</p>
+                <p className={`text-sm font-mono font-semibold ${confCls}`}>
+                  {result.confidence !== undefined ? `${(result.confidence * 100).toFixed(0)}%` : '—'}
+                </p>
               </div>
-              <div className="space-y-2">
-                {selected.stages.map(st => (
-                  <div key={st.name} className={`rounded-lg p-3 ${stageBadge(st.status)} bg-opacity-20 border border-opacity-30`} style={{ borderColor: 'currentColor' }}>
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="font-semibold text-xs">{st.name}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs">{formatMs(st.durationMs)}</span>
-                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${stageBadge(st.status)}`}>
-                          {st.status.toUpperCase()}
-                        </span>
-                      </div>
-                    </div>
-                    {st.detail && <p className="text-xs opacity-80">{st.detail}</p>}
+            </div>
+
+            <div className="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
+              <div className="px-4 py-2 border-b border-zinc-800 flex items-center justify-between">
+                <span className="text-[10px] font-mono text-zinc-600">extraction.json</span>
+                {result._meta?.model && (
+                  <span className="text-[10px] font-mono text-zinc-700">{result._meta.model}</span>
+                )}
+              </div>
+              <pre className="px-4 py-4 text-xs font-mono text-emerald-300/90 overflow-x-auto leading-relaxed">
+                {JSON.stringify(displayResult, null, 2)}
+              </pre>
+            </div>
+
+            {result._meta && (
+              <div className="flex gap-5 text-[10px] font-mono text-zinc-700">
+                {result._meta.input_tokens  != null && <span>{result._meta.input_tokens} in</span>}
+                {result._meta.output_tokens != null && <span>{result._meta.output_tokens} out</span>}
+                {result._meta.latency_ms    != null && <span>{fmtMs(result._meta.latency_ms)} latency</span>}
+              </div>
+            )}
+
+            {(result.flags ?? []).length > 0 && (
+              <div className="space-y-1.5">
+                {result.flags!.map((f, i) => (
+                  <div key={i} className="flex items-start gap-2 text-xs text-amber-400/80">
+                    <svg className="w-3.5 h-3.5 mt-px flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                        d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                    {f}
                   </div>
                 ))}
               </div>
-            </div>
-          ) : (
-            <div className="h-60 flex items-center justify-center text-gray-400 text-sm">
-              Select a run to inspect its stages
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
+
+        {result?.error && (
+          <p className="text-sm text-red-400 font-mono">{result.error}</p>
+        )}
+
+        {!result && !running && (
+          <p className="text-sm text-zinc-700 pt-2">Results appear here after analysis.</p>
+        )}
       </div>
     </div>
   )
 }
 
-// ─── Prompt Regression Tab ────────────────────────────────────────────────────
+// ── Page ──────────────────────────────────────────────────────────────────────
 
-function PromptRegression() {
-  const [selectedVersion, setSelectedVersion] = useState('v1.4.2')
-  const stats = getTestStats()
-  const filtered = testCases.filter(t => t.promptVersion === selectedVersion)
-
-  return (
-    <div className="space-y-6">
-      {/* Prompt version chart */}
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4">
-        <h3 className="font-semibold text-gray-700 text-sm mb-4">Prompt Version History</h3>
-        <div className="overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="text-gray-400 border-b border-gray-100">
-                <th className="text-left pb-2 pr-4 font-medium">Version</th>
-                <th className="text-left pb-2 pr-4 font-medium">Date</th>
-                <th className="text-left pb-2 pr-4 font-medium">Pass Rate</th>
-                <th className="text-left pb-2 pr-4 font-medium">Avg Accuracy</th>
-                <th className="text-left pb-2 pr-4 font-medium">Cases</th>
-                <th className="text-left pb-2 font-medium">Changes</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-50">
-              {promptVersionHistory.map(v => (
-                <tr
-                  key={v.version}
-                  onClick={() => setSelectedVersion(v.version)}
-                  className={`cursor-pointer hover:bg-gray-50 transition-colors ${selectedVersion === v.version ? 'bg-indigo-50' : ''}`}
-                >
-                  <td className="py-2 pr-4 font-mono font-semibold text-indigo-600">{v.version}</td>
-                  <td className="py-2 pr-4 text-gray-500">{v.date}</td>
-                  <td className="py-2 pr-4">
-                    <div className="flex items-center gap-2">
-                      <div className="w-20 bg-gray-100 rounded-full h-1.5">
-                        <div className="bg-emerald-500 h-1.5 rounded-full" style={{ width: `${v.passRate}%` }} />
-                      </div>
-                      <span className="font-medium text-gray-700">{v.passRate}%</span>
-                    </div>
-                  </td>
-                  <td className="py-2 pr-4 font-medium text-gray-700">{v.avgAccuracy}%</td>
-                  <td className="py-2 pr-4 text-gray-600">{v.totalCases}</td>
-                  <td className="py-2 text-gray-500 max-w-xs">{v.changes}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Test cases */}
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
-          <h3 className="font-semibold text-gray-700 text-sm">
-            Golden Dataset — <span className="font-mono text-indigo-600">{selectedVersion}</span>
-          </h3>
-          <div className="flex gap-3 text-xs text-gray-500">
-            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />Pass ({stats.passing})</span>
-            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500 inline-block" />Fail ({stats.failing})</span>
-            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />Edge ({stats.edge})</span>
-          </div>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="text-gray-400 border-b border-gray-100 bg-gray-50">
-                <th className="text-left px-4 py-2 font-medium">Test Case</th>
-                <th className="text-left px-4 py-2 font-medium">Type</th>
-                <th className="text-left px-4 py-2 font-medium">Category</th>
-                <th className="text-left px-4 py-2 font-medium">Accuracy</th>
-                <th className="text-left px-4 py-2 font-medium">Validation</th>
-                <th className="text-left px-4 py-2 font-medium">Routing</th>
-                <th className="text-left px-4 py-2 font-medium">Notes</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {(filtered.length > 0 ? filtered : testCases).map(tc => (
-                <tr key={tc.id} className="hover:bg-gray-50">
-                  <td className="px-4 py-2.5 font-medium text-gray-800 max-w-xs">{tc.name}</td>
-                  <td className="px-4 py-2.5 text-gray-600">{tc.docType}</td>
-                  <td className="px-4 py-2.5">
-                    <span className={`px-2 py-0.5 rounded-full font-semibold text-[10px] ${categoryBadge(tc.category)}`}>
-                      {tc.category.toUpperCase()}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <div className="flex items-center gap-2">
-                      <div className="w-14 bg-gray-100 rounded-full h-1.5">
-                        <div
-                          className={`h-1.5 rounded-full ${tc.extractionAccuracy >= 85 ? 'bg-emerald-500' : tc.extractionAccuracy >= 70 ? 'bg-amber-400' : 'bg-red-500'}`}
-                          style={{ width: `${tc.extractionAccuracy}%` }}
-                        />
-                      </div>
-                      <span className="font-medium text-gray-700">{tc.extractionAccuracy}%</span>
-                    </div>
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <span className={tc.validationPassed ? 'text-emerald-600 font-semibold' : 'text-red-600 font-semibold'}>
-                      {tc.validationPassed ? '✓' : '✗'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <span className={tc.routingCorrect ? 'text-emerald-600 font-semibold' : 'text-red-600 font-semibold'}>
-                      {tc.routingCorrect ? '✓' : '✗'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5 text-gray-500 max-w-xs truncate">{tc.notes}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── Agent Config Tab ─────────────────────────────────────────────────────────
-
-function AgentConfig() {
-  const [selected, setSelected] = useState(agentDefinitions[0])
-
-  return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      {/* Agent list */}
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-100">
-          <h3 className="font-semibold text-gray-700 text-sm">Registered Agents</h3>
-        </div>
-        <ul className="divide-y divide-gray-100">
-          {agentDefinitions.map(agent => (
-            <li
-              key={agent.agentId}
-              onClick={() => setSelected(agent)}
-              className={`px-4 py-3 cursor-pointer hover:bg-gray-50 transition-colors ${selected.agentId === agent.agentId ? 'bg-indigo-50 border-l-4 border-indigo-500' : ''}`}
-            >
-              <p className="text-sm font-semibold text-gray-800">{agent.name}</p>
-              <p className="font-mono text-[10px] text-gray-400 mt-0.5">{agent.agentId}</p>
-              <div className="flex gap-2 mt-1.5">
-                <span className="text-[10px] bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded">{agent.model}</span>
-                <span className="text-[10px] bg-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded">{agent.instructionType}</span>
-              </div>
-            </li>
-          ))}
-        </ul>
-      </div>
-
-      {/* Config detail */}
-      <div className="lg:col-span-2 space-y-4">
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
-          <h3 className="font-semibold text-gray-800 text-base mb-1">{selected.name}</h3>
-          <p className="text-sm text-gray-500 mb-4">{selected.description}</p>
-          <div className="grid grid-cols-2 gap-3 text-xs mb-4">
-            <div className="bg-gray-50 rounded-lg p-3">
-              <p className="text-gray-400 mb-1">Model</p>
-              <p className="font-mono font-semibold text-gray-800">{selected.model}</p>
-            </div>
-            <div className="bg-gray-50 rounded-lg p-3">
-              <p className="text-gray-400 mb-1">Instruction Type</p>
-              <p className="font-semibold text-indigo-700">{selected.instructionType}</p>
-            </div>
-            <div className="bg-gray-50 rounded-lg p-3">
-              <p className="text-gray-400 mb-1">Tenants</p>
-              <div className="flex flex-wrap gap-1 mt-0.5">
-                {selected.tenants.map(t => (
-                  <span key={t} className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded">{t}</span>
-                ))}
-              </div>
-            </div>
-            <div className="bg-gray-50 rounded-lg p-3">
-              <p className="text-gray-400 mb-1">Mappers</p>
-              <div className="flex flex-wrap gap-1 mt-0.5">
-                {selected.mappers.map(m => (
-                  <span key={m} className="text-[10px] bg-teal-100 text-teal-700 px-1.5 py-0.5 rounded font-mono">{m}</span>
-                ))}
-              </div>
-            </div>
-          </div>
-          <div className="mb-3">
-            <p className="text-xs text-gray-400 mb-1.5">Endpoints</p>
-            <div className="space-y-1">
-              {selected.endpoints.map(ep => (
-                <p key={ep} className="font-mono text-xs text-gray-700 bg-gray-50 px-3 py-1.5 rounded">{ep}</p>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* YAML config */}
-        <div className="bg-gray-900 rounded-xl overflow-hidden">
-          <div className="px-4 py-2 bg-gray-800 flex items-center justify-between">
-            <span className="text-xs text-gray-400 font-mono">agent-config.yaml</span>
-            <span className="text-[10px] text-gray-500 font-mono">{selected.agentId}</span>
-          </div>
-          <pre className="text-xs text-emerald-300 p-4 overflow-x-auto font-mono leading-relaxed">
-            {selected.configYaml}
-          </pre>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── API Explorer Tab ─────────────────────────────────────────────────────────
-
-function APIExplorer() {
-  const [selected, setSelected] = useState(apiEndpoints[0])
-
-  return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      {/* Endpoint list */}
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-100">
-          <h3 className="font-semibold text-gray-700 text-sm">REST Endpoints</h3>
-          <p className="text-xs text-gray-400 mt-0.5">FastAPI microservice — internal ops API</p>
-        </div>
-        <ul className="divide-y divide-gray-100">
-          {apiEndpoints.map((ep, i) => (
-            <li
-              key={i}
-              onClick={() => setSelected(ep)}
-              className={`px-4 py-3 cursor-pointer hover:bg-gray-50 transition-colors ${selected === ep ? 'bg-indigo-50' : ''}`}
-            >
-              <div className="flex items-center gap-2 mb-1">
-                <span className={`text-[10px] font-bold px-2 py-0.5 rounded font-mono ${methodBadge(ep.method)}`}>{ep.method}</span>
-                <span className="font-mono text-xs text-gray-700 truncate">{ep.path}</span>
-              </div>
-              <div className="flex items-center gap-3 text-xs text-gray-400">
-                <span>{ep.description}</span>
-              </div>
-              <div className="flex items-center gap-3 mt-1.5 text-[10px] text-gray-400">
-                <span>HTTP {ep.statusCode}</span>
-                <span>·</span>
-                <span>{ep.responseTimeMs}ms</span>
-                <span>·</span>
-                <span>{ep.auth}</span>
-              </div>
-            </li>
-          ))}
-        </ul>
-      </div>
-
-      {/* Detail */}
-      <div className="space-y-4">
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <span className={`text-xs font-bold px-2 py-1 rounded font-mono ${methodBadge(selected.method)}`}>{selected.method}</span>
-            <span className="font-mono text-sm text-gray-800">{selected.path}</span>
-          </div>
-          <p className="text-sm text-gray-600 mb-3">{selected.description}</p>
-          <div className="grid grid-cols-3 gap-2 text-xs">
-            <div className="bg-gray-50 rounded p-2 text-center">
-              <p className="text-gray-400">Status</p>
-              <p className="font-bold text-gray-800">HTTP {selected.statusCode}</p>
-            </div>
-            <div className="bg-gray-50 rounded p-2 text-center">
-              <p className="text-gray-400">Response</p>
-              <p className="font-bold text-gray-800">{selected.responseTimeMs}ms</p>
-            </div>
-            <div className="bg-gray-50 rounded p-2 text-center">
-              <p className="text-gray-400">Auth</p>
-              <p className="font-bold text-gray-800">{selected.auth}</p>
-            </div>
-          </div>
-          <p className="text-[10px] text-gray-400 mt-3">Last tested: {formatDate(selected.lastTested)}</p>
-        </div>
-
-        <div className="bg-gray-900 rounded-xl overflow-hidden">
-          <div className="px-4 py-2 bg-gray-800">
-            <span className="text-xs text-gray-400 font-mono">Request</span>
-          </div>
-          <pre className="text-xs text-blue-300 p-4 overflow-x-auto font-mono leading-relaxed whitespace-pre-wrap">
-            {selected.requestExample}
-          </pre>
-        </div>
-
-        <div className="bg-gray-900 rounded-xl overflow-hidden">
-          <div className="px-4 py-2 bg-gray-800 flex items-center justify-between">
-            <span className="text-xs text-gray-400 font-mono">Response</span>
-            <span className="text-[10px] font-bold text-emerald-400">HTTP {selected.statusCode}</span>
-          </div>
-          <pre className="text-xs text-emerald-300 p-4 overflow-x-auto font-mono leading-relaxed whitespace-pre-wrap">
-            {selected.responseExample}
-          </pre>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── Triage Center Tab ────────────────────────────────────────────────────────
-
-function TriageCenter() {
-  const [selected, setSelected] = useState(triageCases[0])
-  const open = triageCases.filter(t => t.status !== 'resolved').length
-
-  return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-3 gap-4">
-        <StatCard label="Open / Investigating" value={open} sub="requiring attention" />
-        <StatCard label="Resolved" value={triageCases.filter(t => t.status === 'resolved').length} />
-        <StatCard label="Failure Types" value={new Set(triageCases.map(t => t.failureType)).size} sub="distinct categories" />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Issue list */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-100">
-            <h3 className="font-semibold text-gray-700 text-sm">Triage Cases</h3>
-          </div>
-          <ul className="divide-y divide-gray-100">
-            {triageCases.map(tc => (
-              <li
-                key={tc.id}
-                onClick={() => setSelected(tc)}
-                className={`px-4 py-3 cursor-pointer hover:bg-gray-50 transition-colors ${selected.id === tc.id ? 'bg-indigo-50' : ''}`}
-              >
-                <div className="flex items-start justify-between gap-2 mb-1.5">
-                  <p className="text-sm font-medium text-gray-800 leading-snug">{tc.title}</p>
-                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full flex-shrink-0 ${triageStatusBadge(tc.status)}`}>
-                    {tc.status.toUpperCase()}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${failureTypeBadge(tc.failureType)}`}>{tc.failureType}</span>
-                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${severityBadge(tc.severity)}`}>{tc.severity.toUpperCase()}</span>
-                  <span className="text-[10px] text-gray-400">{tc.tenant}</span>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-
-        {/* Detail */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-100 flex items-center gap-2">
-            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${failureTypeBadge(selected.failureType)}`}>{selected.failureType}</span>
-            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${severityBadge(selected.severity)}`}>{selected.severity.toUpperCase()}</span>
-            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ml-auto ${triageStatusBadge(selected.status)}`}>{selected.status.toUpperCase()}</span>
-          </div>
-          <div className="p-4 space-y-4 overflow-y-auto max-h-[calc(100vh-28rem)]">
-            <div>
-              <h4 className="text-sm font-semibold text-gray-800 mb-1">{selected.title}</h4>
-              <div className="flex items-center gap-3 text-xs text-gray-400">
-                <span>{selected.tenant}</span>
-                <span>·</span>
-                <span className="font-mono">{selected.pipelineRunId}</span>
-                <span>·</span>
-                <span>{formatDate(selected.openedAt)}</span>
-              </div>
-            </div>
-
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-              <p className="text-xs font-semibold text-amber-700 mb-1">Observed</p>
-              <p className="text-xs text-amber-900 leading-relaxed">{selected.observed}</p>
-            </div>
-
-            <div>
-              <p className="text-xs font-semibold text-gray-600 mb-2">Reproduction Steps</p>
-              <ol className="space-y-1">
-                {selected.reproSteps.map((step, i) => (
-                  <li key={i} className="flex gap-2 text-xs text-gray-700">
-                    <span className="flex-shrink-0 w-4 h-4 rounded-full bg-indigo-100 text-indigo-700 font-bold text-[9px] flex items-center justify-center">{i + 1}</span>
-                    <span className="font-mono leading-relaxed">{step}</span>
-                  </li>
-                ))}
-              </ol>
-            </div>
-
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
-              <p className="text-xs font-semibold text-blue-700 mb-1">Diagnosis</p>
-              <p className="text-xs text-blue-900 leading-relaxed">{selected.diagnosis}</p>
-            </div>
-
-            <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
-              <p className="text-xs font-semibold text-emerald-700 mb-1">Resolution</p>
-              <p className="text-xs text-emerald-900 leading-relaxed">{selected.resolution}</p>
-              {selected.closedAt && (
-                <p className="text-[10px] text-emerald-600 mt-1.5">Closed: {formatDate(selected.closedAt)}</p>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── Main Page ────────────────────────────────────────────────────────────────
-
-const TABS = [
-  { id: 'pipeline', label: 'Pipeline Monitor', icon: '⚡' },
-  { id: 'regression', label: 'Prompt Regression', icon: '🧪' },
-  { id: 'agents', label: 'Agent Config', icon: '🤖' },
-  { id: 'api', label: 'API Explorer', icon: '🔌' },
-  { id: 'triage', label: 'Triage Center', icon: '🔍' },
-]
+const TABS = ['Intelligence', 'Analyzer'] as const
+type Tab = (typeof TABS)[number]
 
 export default function AIOpsDashboard() {
-  const [activeTab, setActiveTab] = useState('pipeline')
+  const [tab, setTab] = useState<Tab>('Intelligence')
 
   return (
-    <div className="h-full flex flex-col">
-      {/* Page header */}
-      <div className="mb-4 flex-shrink-0">
-        <h2 className="text-2xl font-bold text-gray-800">AI Operations Dashboard</h2>
-        <p className="text-gray-500 text-sm mt-1">
-          Pipeline monitoring · Prompt regression · Agent configuration · API testing · Failure triage
-        </p>
+    <div className="min-h-full bg-zinc-950 rounded-xl -m-6 px-8 py-8">
+      {/* Header */}
+      <div className="flex items-start justify-between mb-8">
+        <div>
+          <h2 className="text-lg font-semibold text-zinc-50 tracking-tight">AI Operations</h2>
+          <p className="text-sm text-zinc-500 mt-0.5">
+            Investment intelligence &amp; document extraction pipeline
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5 pt-0.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          <span className="text-[11px] text-zinc-600 font-mono">operational</span>
+        </div>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1.5 flex-wrap mb-5 flex-shrink-0 bg-gray-100 p-1.5 rounded-xl w-fit">
-        {TABS.map(tab => (
-          <TabBtn
-            key={tab.id}
-            id={tab.id}
-            label={tab.label}
-            icon={tab.icon}
-            active={activeTab === tab.id}
-            onClick={setActiveTab}
-          />
+      <div className="flex gap-7 border-b border-zinc-800 mb-8">
+        {TABS.map(t => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`pb-3 text-sm font-medium transition-colors relative ${
+              tab === t ? 'text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            {t}
+            {tab === t && <span className="absolute bottom-0 inset-x-0 h-px bg-indigo-500" />}
+          </button>
         ))}
       </div>
 
-      {/* Tab content */}
-      <div className="flex-1 overflow-y-auto min-h-0">
-        {activeTab === 'pipeline' && <PipelineMonitor />}
-        {activeTab === 'regression' && <PromptRegression />}
-        {activeTab === 'agents' && <AgentConfig />}
-        {activeTab === 'api' && <APIExplorer />}
-        {activeTab === 'triage' && <TriageCenter />}
+      <div className="max-w-4xl">
+        {tab === 'Intelligence' && <Intelligence />}
+        {tab === 'Analyzer'     && <Analyzer />}
       </div>
     </div>
   )
